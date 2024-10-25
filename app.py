@@ -1,7 +1,14 @@
 import requests
 from cryptography.fernet import Fernet
-from flask import (Flask, make_response, redirect, render_template, request,
-                   session, url_for)
+from flask import (
+    Flask,
+    make_response,
+    redirect,
+    render_template,
+    request,
+    session,
+    url_for,
+)
 from flask_restful import Api, Resource
 
 from config import Config
@@ -9,7 +16,6 @@ from db import db
 from models.users import sync_users
 
 # set up Flask app
-# TODO: Use an app factory instead
 app = Flask(__name__)
 api = Api(app)
 app.config.from_object(Config)
@@ -66,20 +72,36 @@ class ListUsers(Resource):
         Syncs database with Slack workspace user list and renders all users in
         workspace in table
         """
+        # get & decrypt access token
         access_token = session.get("access_token")
         if not access_token:
             return redirect(url_for("login"))
         access_token = cipher.decrypt(access_token.encode()).decode()
+        # send access token over the wire
         response = requests.get(
             "https://slack.com/api/users.list",
             headers={"Authorization": f"Bearer {access_token}"},
         ).json()
+        if not response.get("ok") and response.get("error", "") == "ratelimited":
+            return {"error": "Rate limited by Slack. Slow down!"}, 429
         if not response.get("ok"):
             return {"error": "Unable to fetch users"}, 400
+        # process response
         users = response.get("members", [])
-        list_users = [
-            {"slack_id": slack_id, "name": name} for slack_id, name in sync_users(users)
+        alias_team = lambda x: "slack_id" if x == "team_id" else x
+        slack_users = [
+            {
+                alias_team(k): user[k]
+                for k in ["team_id", "name"]
+                if (k in user and not user.get("deleted", False))
+            }
+            for user in users
         ]
+        list_users = [
+            {"slack_id": slack_id, "name": name}
+            for slack_id, name in sync_users(slack_users)
+        ]
+        # send back users to view
         response = make_response(
             render_template("list_users.html", list_users=list_users)
         )
@@ -93,4 +115,4 @@ api.add_resource(OAuthCallback, "/oauth/callback")
 api.add_resource(ListUsers, "/users", endpoint="users")
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(debug=False)

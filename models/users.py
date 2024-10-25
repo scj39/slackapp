@@ -1,15 +1,18 @@
+from typing import Optional
+
 from sqlalchemy import (
     Column,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     String,
     func,
-    Index,
     tuple_,
 )
-from db import db, Operation
-from typing import Optional
+from sqlalchemy.dialects.postgresql import insert
+
+from db import Operation, db
 
 
 class User(db.Model):
@@ -18,7 +21,8 @@ class User(db.Model):
     slack_id = Column(String, nullable=False)
     name = Column(String, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
-    deleted_at = Column(DateTime(timezone=True))
+    updated_at = Column(DateTime(timezone=True), server_default=func.now())
+    # compound index on slack_id and name
     __table_args__ = (
         Index(
             "idx_slack_id_name",
@@ -53,19 +57,18 @@ def delete_users_by_unique_constraint(
 def sync_users(slack_users: list[dict]) -> Optional[set[tuple[str, str]]]:
     """Syncs users. Deletes users that exist only on the app (and not in the corresponding
     Slack workspace.
-    TODO: Instead of fetching all users and then adding/deleting, perform an upsert and
-    then delete all entries that haven't just been modified for better scalability
     """
-    latest_slack_users, users_for_deletion = set(), None
+    slack_users = [user for user in slack_users if user]
     with Operation.begin() as transaction:
-        existing_users = get_existing_users_by_unique_constraint(transaction)
-        for user in slack_users:
-            if not user.get("deleted", True):
-                latest_slack_users.add((user["id"], user["real_name"]))
-                if (user["id"], user["real_name"]) not in existing_users:
-                    transaction.add(User(slack_id=user["id"], name=user["real_name"]))
-        users_for_deletion = existing_users - latest_slack_users
-        if users_for_deletion:
-            delete_users_by_unique_constraint(transaction, users_for_deletion)
-        existing_users = get_existing_users_by_unique_constraint(transaction)
-        return existing_users
+        upsert_time = func.now()
+        insertion = insert(User.__table__).values(
+            slack_users,
+        )
+        upsert = insertion.on_conflict_do_update(
+            index_elements=["slack_id", "name"], set_={"updated_at": upsert_time}
+        )
+        transaction.execute(upsert)
+        transaction.execute(
+            User.__table__.delete().where(User.updated_at < upsert_time)
+        )
+        return get_existing_users_by_unique_constraint(transaction)
